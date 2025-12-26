@@ -238,6 +238,101 @@ const generateThumbnail = (videoPath, thumbnailPath) => {
     });
 };
 
+// --- Background Thumbnail Generation ---
+
+let thumbnailGenerationInProgress = false;
+let thumbnailGenerationQueue = [];
+
+// Generate thumbnail for a single video
+const generateThumbnailForVideo = async (videoFile) => {
+    const { filename, key } = videoFile;
+    const thumbnailFilename = `${path.parse(filename).name}.png`;
+    const thumbnailCachePath = path.join(THUMBNAIL_CACHE_DIR, thumbnailFilename);
+
+    // Skip if thumbnail already exists
+    if (fs.existsSync(thumbnailCachePath)) {
+        return { filename, status: 'exists' };
+    }
+
+    const tempVideoPath = path.join(CACHE_DIR, `temp_${filename}`);
+
+    try {
+        console.log(`[Thumbnail] Downloading video for thumbnail: ${filename}`);
+        await downloadFromR2(key, tempVideoPath);
+
+        console.log(`[Thumbnail] Generating thumbnail: ${filename}`);
+        await generateThumbnail(tempVideoPath, thumbnailCachePath);
+
+        // Clean up temp file
+        if (fs.existsSync(tempVideoPath)) {
+            fs.unlinkSync(tempVideoPath);
+        }
+
+        return { filename, status: 'generated' };
+    } catch (error) {
+        console.error(`[Thumbnail] Failed for ${filename}:`, error.message);
+
+        // Clean up temp file on error
+        if (fs.existsSync(tempVideoPath)) {
+            try { fs.unlinkSync(tempVideoPath); } catch (e) { }
+        }
+
+        return { filename, status: 'failed', error: error.message };
+    }
+};
+
+// Process thumbnail generation queue
+const processThumbnailQueue = async () => {
+    if (thumbnailGenerationInProgress || thumbnailGenerationQueue.length === 0) {
+        return;
+    }
+
+    thumbnailGenerationInProgress = true;
+    console.log(`[Thumbnail] Starting queue processing. ${thumbnailGenerationQueue.length} videos pending.`);
+
+    while (thumbnailGenerationQueue.length > 0) {
+        const videoFile = thumbnailGenerationQueue.shift();
+        const result = await generateThumbnailForVideo(videoFile);
+        console.log(`[Thumbnail] ${result.filename}: ${result.status}`);
+
+        // Small delay between processing to avoid overwhelming the system
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    thumbnailGenerationInProgress = false;
+    console.log(`[Thumbnail] Queue processing complete.`);
+};
+
+// Scan all videos and queue thumbnail generation for missing ones
+const queueMissingThumbnails = async () => {
+    console.log('[Thumbnail] Scanning for missing thumbnails...');
+
+    const videoFiles = await listR2Videos();
+    let queued = 0;
+    let existing = 0;
+
+    for (const videoFile of videoFiles) {
+        const thumbnailFilename = `${path.parse(videoFile.filename).name}.png`;
+        const thumbnailCachePath = path.join(THUMBNAIL_CACHE_DIR, thumbnailFilename);
+
+        if (!fs.existsSync(thumbnailCachePath)) {
+            thumbnailGenerationQueue.push(videoFile);
+            queued++;
+        } else {
+            existing++;
+        }
+    }
+
+    console.log(`[Thumbnail] Found ${existing} existing, ${queued} queued for generation.`);
+
+    // Start processing if there are items in queue
+    if (queued > 0) {
+        processThumbnailQueue();
+    }
+
+    return { existing, queued, total: videoFiles.length };
+};
+
 // --- Helper Function to Get Video Details (Modified for R2) ---
 
 const getVideoDetails = async (videoFile, metadata) => {
@@ -275,37 +370,37 @@ const getVideoDetails = async (videoFile, metadata) => {
     const thumbnailCachePath = path.join(THUMBNAIL_CACHE_DIR, thumbnailFilename);
     const thumbnailR2Key = `videos/thumbnails/${thumbnailFilename}`;
 
-    let thumbnail_url = `/thumbnails/${thumbnailFilename}`;
+    let thumbnail_url = null;
 
-    // Check if thumbnail exists in cache
-    if (!fs.existsSync(thumbnailCachePath)) {
-        console.log(`Thumbnail not in cache for ${filename}, checking R2...`);
+    // First, try to get thumbnail from R2 with a signed URL
+    const thumbnailMeta = await getR2ObjectMetadata(thumbnailR2Key);
+    if (thumbnailMeta) {
+        // Generate signed URL for R2 thumbnail
+        thumbnail_url = await getSignedVideoUrl(thumbnailR2Key, 86400); // 24 hour expiry
+        console.log(`Using R2 signed URL for thumbnail: ${filename}`);
+    } else if (fs.existsSync(thumbnailCachePath)) {
+        // Use local cache if available
+        thumbnail_url = `/thumbnails/${thumbnailFilename}`;
+        console.log(`Using cached thumbnail for: ${filename}`);
+    } else {
+        // Try to generate thumbnail from video
+        console.log(`Generating thumbnail for ${filename}...`);
+        const tempVideoPath = path.join(CACHE_DIR, `temp_${filename}`);
 
-        // Try to get from R2 first
-        const thumbnailMeta = await getR2ObjectMetadata(thumbnailR2Key);
-        if (thumbnailMeta) {
-            // Download from R2 to cache
-            await downloadFromR2(thumbnailR2Key, thumbnailCachePath);
-            console.log(`Downloaded thumbnail from R2 for ${filename}`);
-        } else {
-            // Generate thumbnail from video
-            console.log(`Generating thumbnail for ${filename}...`);
-            const tempVideoPath = path.join(CACHE_DIR, `temp_${filename}`);
-
-            try {
-                // Download video temporarily
-                await downloadFromR2(key, tempVideoPath);
-                // Generate thumbnail
-                await generateThumbnail(tempVideoPath, thumbnailCachePath);
-                // Clean up temp video
+        try {
+            // Download video temporarily
+            await downloadFromR2(key, tempVideoPath);
+            // Generate thumbnail
+            await generateThumbnail(tempVideoPath, thumbnailCachePath);
+            // Clean up temp video
+            if (fs.existsSync(tempVideoPath)) {
                 fs.unlinkSync(tempVideoPath);
-
-                // TODO: Optionally upload generated thumbnail back to R2
-                // uploadToR2(thumbnailCachePath, thumbnailR2Key);
-            } catch (error) {
-                console.error(`Could not generate thumbnail for ${filename}.`);
-                thumbnail_url = '/default-thumbnail.png'; // fallback
             }
+            thumbnail_url = `/thumbnails/${thumbnailFilename}`;
+            console.log(`Generated thumbnail for: ${filename}`);
+        } catch (error) {
+            console.error(`Could not generate thumbnail for ${filename}:`, error.message);
+            thumbnail_url = null; // No fallback, let the app handle it
         }
     }
 
@@ -503,6 +598,51 @@ app.get('/api/search',
         }
     });
 
+// --- Thumbnail Generation API ---
+
+// Get thumbnail generation status
+app.get('/api/thumbnails/status', (req, res) => {
+    res.json({
+        in_progress: thumbnailGenerationInProgress,
+        queue_length: thumbnailGenerationQueue.length,
+        cache_dir: THUMBNAIL_CACHE_DIR
+    });
+});
+
+// Trigger thumbnail generation for all missing thumbnails
+app.post('/api/thumbnails/generate', async (req, res) => {
+    try {
+        const result = await queueMissingThumbnails();
+        res.json({
+            success: true,
+            message: `Thumbnail generation started`,
+            ...result
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// List all cached thumbnails
+app.get('/api/thumbnails/list', (req, res) => {
+    try {
+        const files = fs.readdirSync(THUMBNAIL_CACHE_DIR);
+        const thumbnails = files.filter(f => f.endsWith('.png')).map(f => ({
+            filename: f,
+            url: `/thumbnails/${f}`
+        }));
+        res.json({
+            count: thumbnails.length,
+            thumbnails
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // --- Static File Serving ---
 
 app.use('/thumbnails', express.static(THUMBNAIL_CACHE_DIR));
@@ -585,9 +725,17 @@ app.use((req, res) => {
 
 // --- Start Server ---
 
-app.listen(PORT, HOST, () => {
+app.listen(PORT, HOST, async () => {
     console.log(`✅ Server is running at http://${HOST}:${PORT}`);
     console.log(`📦 R2 Bucket: ${R2_BUCKET_NAME}`);
     console.log(`🔗 R2 Endpoint: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`);
     console.log(`🩺 Health check: http://${HOST}:${PORT}/health`);
+
+    // Start background thumbnail generation
+    console.log('\n🖼️  Starting automatic thumbnail generation...');
+    try {
+        await queueMissingThumbnails();
+    } catch (error) {
+        console.error('Error starting thumbnail generation:', error.message);
+    }
 });
